@@ -42,4 +42,4 @@ This runs the builder under QEMU emulation, so compiling a language from source 
 
 ## Working branch
 
-Active work happens on `develop`, branched from `master`.
+`master` is protected — it only receives syncs from the upstream fork (`engineer-man/piston`), never direct work. All work happens on top of `develop`, which is rebased when syncing with upstream.
