@@ -1,0 +1,119 @@
+# Standalone Piston API image for platforms that can't run the docker-compose dev
+# stack (e.g. AWS App Runner: single container, no sidecar `repo` service, no shared
+# volume to `ppman install` into). The fixed runtime set below is compiled and baked
+# straight into /piston/packages at build time, so the container is self-contained on
+# boot -- no network fetch from a package repo, no install step, no volume required.
+#
+# To change the runtime set: edit the `make` target list in the `pkgbuilder` stage and
+# the COPY/RUN blocks in the final stage to match.
+
+# ---- Stage 1: compile the fixed runtime set ----
+# Mirrors repo/Dockerfile's toolchain (same buster-archive fix, same package deps).
+FROM debian:buster-slim AS pkgbuilder
+ENV DEBIAN_FRONTEND=noninteractive
+RUN sed -i \
+        -e 's|deb.debian.org|archive.debian.org|g' \
+        -e '/security.debian.org/d' \
+        /etc/apt/sources.list && \
+    echo 'Acquire::Check-Valid-Until "false";' > /etc/apt/apt.conf.d/99no-check-valid-until
+RUN apt-get update && apt-get install -y unzip autoconf build-essential libssl-dev \
+        pkg-config zlib1g-dev libargon2-dev libsodium-dev libcurl4-openssl-dev \
+        sqlite3 libsqlite3-dev libonig-dev libxml2 libxml2-dev bc curl git \
+        linux-headers-amd64 perl xz-utils python3 python3-pip gnupg jq zlib1g-dev \
+        cmake cmake-doc extra-cmake-modules build-essential gcc binutils bash coreutils \
+        util-linux pciutils usbutils coreutils binutils findutils grep libncurses5-dev \
+        libncursesw5-dev python3-pip libgmp-dev libmpfr-dev python2 libffi-dev gfortran \
+        libreadline-dev libblas-dev liblapack-dev libpcre3-dev libarpack2-dev libfftw3-dev \
+        libglpk-dev libqhull-dev libqrupdate-dev libsuitesparse-dev libsundials-dev \
+        libbz2-dev liblzma-dev libpcre2-dev gperf bison flex g++ gawk zip && \
+        ln -sf /bin/bash /bin/sh && \
+        rm -rf /var/lib/apt/lists/* && \
+        update-alternatives --install /usr/bin/python python /usr/bin/python3.7 2
+
+WORKDIR /piston
+COPY packages ./packages
+
+# Fixed runtime set for this deployment. `make` also emits pkg-info.json (via the
+# %/pkg-info.json rule) inside each package dir -- that's what api/src/runtime.js
+# reads to register a runtime, so it must end up on disk either way.
+RUN cd packages && make -j"$(nproc)" \
+        python-3.14.0.pkg.tar.gz \
+        node-20.11.1.pkg.tar.gz \
+        typescript-5.0.3.pkg.tar.gz \
+        bash-5.2.0.pkg.tar.gz \
+        PLATFORM=docker-debian
+
+# ---- Stage 2: isolate sandbox binary (unchanged from api/Dockerfile) ----
+FROM buildpack-deps:buster AS isolate
+RUN sed -i \
+        -e 's|deb.debian.org|archive.debian.org|g' \
+        -e '/security.debian.org/d' \
+        /etc/apt/sources.list && \
+    echo 'Acquire::Check-Valid-Until "false";' > /etc/apt/apt.conf.d/99no-check-valid-until
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends git libcap-dev && \
+    rm -rf /var/lib/apt/lists/* && \
+    git clone https://github.com/envicutor/isolate.git /tmp/isolate/ && \
+    cd /tmp/isolate && \
+    git checkout af6db68042c3aa0ded80787fbb78bc0846ea2114 && \
+    make -j"$(nproc)" install && \
+    rm -rf /tmp/*
+
+# ---- Stage 3: final image ----
+FROM node:15.10.0-buster-slim
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN dpkg-reconfigure -p critical dash
+RUN sed -i \
+        -e 's|deb.debian.org|archive.debian.org|g' \
+        -e '/security.debian.org/d' \
+        /etc/apt/sources.list && \
+    echo 'Acquire::Check-Valid-Until "false";' > /etc/apt/apt.conf.d/99no-check-valid-until
+RUN apt-get update && \
+    apt-get install -y libxml2 gnupg tar coreutils util-linux libc6-dev \
+    binutils build-essential locales libpcre3-dev libevent-dev libgmp3-dev \
+    libncurses6 libncurses5 libedit-dev libseccomp-dev rename procps python3 \
+    libreadline-dev libblas-dev liblapack-dev libpcre3-dev libarpack2-dev \
+    libfftw3-dev libglpk-dev libqhull-dev libqrupdate-dev libsuitesparse-dev \
+    libsundials-dev libpcre2-dev libcap-dev && \
+    rm -rf /var/lib/apt/lists/*
+RUN useradd -M piston
+COPY --from=isolate /usr/local/bin/isolate /usr/local/bin
+COPY --from=isolate /usr/local/etc/isolate /usr/local/etc/isolate
+
+RUN sed -i '/en_US.UTF-8/s/^# //g' /etc/locale.gen && locale-gen
+
+WORKDIR /piston_api
+COPY api/package.json api/package-lock.json ./
+RUN npm install
+COPY api/src ./src
+
+# --- Bake the fixed runtime set into /piston/packages ---
+# Each COPY brings over the already-built package dir (interpreter + run/environment/
+# pkg-info.json) exactly as `tar czf` would have packed it for ppman -- we just skip
+# the tar/untar round-trip since builder and final stage share this one image build.
+COPY --from=pkgbuilder /piston/packages/python/3.14.0     /piston/packages/python/3.14.0
+COPY --from=pkgbuilder /piston/packages/node/20.11.1      /piston/packages/node/20.11.1
+COPY --from=pkgbuilder /piston/packages/typescript/5.0.3  /piston/packages/typescript/5.0.3
+COPY --from=pkgbuilder /piston/packages/bash/5.2.0        /piston/packages/bash/5.2.0
+
+# Mirror the two things api/src/package.js's install() normally does after extracting
+# a package, since we bypassed install() entirely by copying the dir straight in:
+#   1. .env       - cached `source environment` output; runtime.js reads this on first
+#                    execution and throws if it's missing.
+#   2. .ppman-installed - marker api/src/index.js's boot-time scan checks for before
+#                    calling runtime.load_package() on a package dir.
+RUN for pkgdir in \
+        /piston/packages/python/3.14.0 \
+        /piston/packages/node/20.11.1 \
+        /piston/packages/typescript/5.0.3 \
+        /piston/packages/bash/5.2.0 \
+    ; do \
+        ( cd "$pkgdir" && env -i bash -c 'source environment && env' \
+            | grep -Ev '^(PWD|OLDPWD|_|SHLVL)=' > "$pkgdir/.env" ) && \
+        touch "$pkgdir/.ppman-installed" ; \
+    done
+
+CMD ["/piston_api/src/docker-entrypoint.sh"]
+EXPOSE 2000/tcp
