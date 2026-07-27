@@ -33,6 +33,7 @@
   <a href="#Supported-Languages">Supported Languages</a> •
   <a href="#Principle-of-Operation">Principles</a> •
   <a href="#Security">Security</a> •
+  <a href="#Standalone-Deployments-Dockerfileprebuilt">Standalone Deployments</a> •
   <a href="#License">License</a> •
   <a href="https://piston.readthedocs.io">Documentation</a>
 </h4>
@@ -469,6 +470,87 @@ Piston uses Isolate which makes use of Linux namespaces, chroot, multiple unpriv
 -   Capping the peak memory that all the submission's processes can use
 -   Capping stdout to 1024 characters by default (resists yes/no bombs and runaway output)
 -   SIGKILLing misbehaving code
+
+<br>
+
+# Standalone Deployments (Dockerfile.prebuilt)
+
+The normal setup (`api/Dockerfile` + `docker-compose.dev.yaml`) installs runtimes at
+container **start time**: an `api` container and a `repo` container share a Docker
+volume, and `ppman install <language>=<version>` downloads a package from the `repo`
+container's index into that volume. This is flexible -- add or swap a language without
+rebuilding the API image -- but it depends on having both a sidecar container and a
+persistent/shared volume.
+
+Some platforms don't offer either. AWS App Runner, for example, runs a single
+container per service with no sidecar and no writable volume that survives a
+redeploy. For that class of deployment, `Dockerfile.prebuilt` (repo root) builds a
+single self-contained image with a **fixed** set of runtimes compiled and baked
+directly into `/piston/packages` at `docker build` time, so the container is ready to
+execute code the moment it boots -- no `repo` service, no volume, no `ppman install`
+call required.
+
+```
+docker build -f Dockerfile.prebuilt -t my-piston-prebuilt .
+docker run --privileged -p 2000:2000 my-piston-prebuilt
+```
+
+The tradeoff: the runtime set is fixed at build time. Adding a language, or bumping a
+version, means editing the Dockerfile and rebuilding the image -- there's no live
+install step.
+
+### Adding another runtime
+
+`Dockerfile.prebuilt` has three stages: `pkgbuilder` (compiles the packages),
+`isolate` (builds the sandbox binary, unchanged from `api/Dockerfile`), and the final
+image. To bake in an additional language, touch only the `pkgbuilder` build and the
+two blocks in the final stage that copy a built package in and register it.
+
+As an example, here's adding `ruby=3.0.1` (an existing package under
+`packages/ruby/3.0.1/`) alongside the four runtimes already baked in:
+
+1. **Add it to the `make` target list** in the `pkgbuilder` stage, so it actually gets
+   compiled during the build:
+
+   ```diff
+    RUN cd packages && make -j"$(nproc)" \
+            python-3.14.0.pkg.tar.gz \
+            node-20.11.1.pkg.tar.gz \
+            typescript-5.0.3.pkg.tar.gz \
+            bash-5.2.0.pkg.tar.gz \
+   +        ruby-3.0.1.pkg.tar.gz \
+            PLATFORM=docker-debian
+   ```
+
+2. **Copy the built package dir** into the final image, in the `COPY --from=pkgbuilder`
+   block:
+
+   ```diff
+    COPY --from=pkgbuilder /piston/packages/bash/5.2.0        /piston/packages/bash/5.2.0
+   +COPY --from=pkgbuilder /piston/packages/ruby/3.0.1         /piston/packages/ruby/3.0.1
+   ```
+
+3. **Add it to the `for pkgdir in ...` loop** that generates `.env` and
+   `.ppman-installed` for each package (these two files are normally only created by a
+   live `ppman install` -- see `api/src/package.js`'s `install()` -- so the loop
+   recreates them at build time instead):
+
+   ```diff
+    RUN for pkgdir in \
+            /piston/packages/python/3.14.0 \
+            /piston/packages/node/20.11.1 \
+            /piston/packages/typescript/5.0.3 \
+            /piston/packages/bash/5.2.0 \
+   +        /piston/packages/ruby/3.0.1 \
+        ; do \
+   ```
+
+That's it -- no other stage needs to change. If the language doesn't already exist
+under `packages/`, follow `packages/CONTRIBUTING.MD` to add it first (copy the nearest
+existing version dir, adjust `build.sh`/`run`/`metadata.json`), confirm it builds and
+passes its `test.*` via the normal dev flow (`./piston build-pkg`, `./piston ppman
+install`, `./piston run`), *then* add it to `Dockerfile.prebuilt` using the steps
+above.
 
 <br>
 
